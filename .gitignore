@@ -1,4 +1,6 @@
 linux-7.1.9/
+ca0132-oot/ca0132.c
+ca0132-oot/ca0132_regs.h
 ca0132-oot/*.o
 ca0132-oot/*.ko
 ca0132-oot/*.mod
