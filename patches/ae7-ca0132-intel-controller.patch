@@ -1,0 +1,555 @@
+diff --git i/sound/hda/codecs/ca0132.c w/sound/hda/codecs/ca0132.c
+index be565ff..b37ff50 100644
+--- i/sound/hda/codecs/ca0132.c
++++ w/sound/hda/codecs/ca0132.c
+@@ -74,6 +74,11 @@
+ #define DESKTOP_EFX_FILE   "ctefx-desktop.bin"
+ #define R3DI_EFX_FILE  "ctefx-r3di.bin"
+ 
++static bool ae7_bar2_after_crst;
++module_param_named(ae7_bar2, ae7_bar2_after_crst, bool, 0444);
++MODULE_PARM_DESC(ae7_bar2, "Allow AE-7 BAR2 MMIO after HDA CRST (unsafe)");
++static bool ae7_cmd_dead;
++
+ #ifdef CONFIG_SND_HDA_CODEC_CA0132_DSP
+ MODULE_FIRMWARE(EFX_FILE);
+ MODULE_FIRMWARE(DESKTOP_EFX_FILE);
+@@ -3627,12 +3632,50 @@ static bool dspload_wait_loaded(struct hda_codec *codec)
+  * of the on-card LED. It seems to use pin 2 for data, then toggles 3 to on and
+  * then off to send that bit.
+  */
++static bool ae7_gcap_ok(struct hda_codec *codec, const char *stage)
++{
++	struct hdac_bus *bus = codec->core.bus;
++	u16 gcap = 0xffff;
++	u32 id = 0xffffffff;
++
++	if (bus && bus->remap_addr)
++		gcap = readw(bus->remap_addr);
++	if (codec->bus && codec->bus->pci)
++		pci_read_config_dword(codec->bus->pci, PCI_VENDOR_ID, &id);
++	codec_info(codec, "AE7dbg %s: GCAP=%#x pci=%#x\n", stage, gcap, id);
++	if (gcap == 0xffff || id == 0xffffffff) {
++		codec_err(codec, "AE-7 died at %s\n", stage);
++		ae7_cmd_dead = true;
++		return false;
++	}
++	return true;
++}
++
++static bool ae7_block_bar2(struct hda_codec *codec)
++{
++	struct ca0132_spec *spec = codec->spec;
++
++	if (ca0132_quirk(spec) != QUIRK_AE7)
++		return false;
++	if (ae7_bar2_after_crst)
++		return false;
++	if (ae7_cmd_dead)
++		return true;
++	return spec->dsp_state != DSP_DOWNLOADED;
++}
++
+ static void ca0113_mmio_gpio_set(struct hda_codec *codec, unsigned int gpio_pin,
+ 		bool enable)
+ {
+ 	struct ca0132_spec *spec = codec->spec;
+ 	unsigned short gpio_data;
+ 
++	if (!spec->mem_base)
++		return;
++	if (ca0132_quirk(spec) == QUIRK_AE7)
++		codec_info(codec, "AE-7 BAR2 GPIO pin %u -> %d\n",
++			   gpio_pin, enable);
++
+ 	gpio_data = gpio_pin & 0xF;
+ 	gpio_data |= ((enable << 8) & 0x100);
+ 
+@@ -3653,6 +3696,14 @@ static void ca0113_mmio_command_set(struct hda_codec *codec, unsigned int group,
+ 	struct ca0132_spec *spec = codec->spec;
+ 	unsigned int write_val;
+ 
++	if (ae7_block_bar2(codec))
++		return;
++	if (!spec->mem_base)
++		return;
++	if (ca0132_quirk(spec) == QUIRK_AE7)
++		codec_info(codec, "AE-7 mmio_cmd group=%#x tgt=%#x val=%#x\n",
++			   group, target, value);
++
+ 	writel(0x0000007e, spec->mem_base + 0x210);
+ 	readl(spec->mem_base + 0x210);
+ 	writel(0x0000005a, spec->mem_base + 0x210);
+@@ -3681,6 +3732,9 @@ static void ca0113_mmio_command_set(struct hda_codec *codec, unsigned int group,
+ 	writel(0x00000000, spec->mem_base + 0x210);
+ 	readl(spec->mem_base + 0x210);
+ 	readl(spec->mem_base + 0x210);
++
++	if (ca0132_quirk(spec) == QUIRK_AE7)
++		ae7_gcap_ok(codec, "mmio_cmd");
+ }
+ 
+ /*
+@@ -3692,6 +3746,9 @@ static void ca0113_mmio_command_set_type2(struct hda_codec *codec,
+ 	struct ca0132_spec *spec = codec->spec;
+ 	unsigned int write_val;
+ 
++	if (ae7_block_bar2(codec))
++		return;
++
+ 	writel(0x0000007e, spec->mem_base + 0x210);
+ 	readl(spec->mem_base + 0x210);
+ 	writel(0x0000005a, spec->mem_base + 0x210);
+@@ -4877,6 +4934,8 @@ static void ca0132_unsol_hp_delayed(struct work_struct *work)
+ 		to_delayed_work(work), struct ca0132_spec, unsol_hp_work);
+ 	struct hda_jack_tbl *jack;
+ 
++	if (ca0132_quirk(spec) == QUIRK_AE7)
++		return;
+ 	if (ca0132_use_alt_functions(spec))
+ 		ca0132_alt_select_out(spec->codec);
+ 	else
+@@ -5551,6 +5610,12 @@ static int ca0132_vnode_switch_set(struct snd_kcontrol *kcontrol,
+ 	}
+ 
+ 	if (nid == VNID_HP_ASEL) {
++		if (ca0132_quirk(spec) == QUIRK_AE7) {
++			spec->vnode_lswitch[VNID_HP_ASEL - VNODE_START_NID] = 0;
++			codec_info(codec,
++				   "AE-7: ignoring HP/Speaker Auto Detect (hangs this card)\n");
++			return 1;
++		}
+ 		if (ca0132_use_alt_functions(spec))
+ 			ca0132_alt_select_out(codec);
+ 		else
+@@ -8523,6 +8588,7 @@ static bool ca0132_download_dsp_images(struct hda_codec *codec)
+ 	case QUIRK_SBZ:
+ 	case QUIRK_R3D:
+ 	case QUIRK_AE5:
++	case QUIRK_AE7:
+ 		if (request_firmware(&fw_entry, DESKTOP_EFX_FILE,
+ 					codec->card->dev) != 0)
+ 			codec_dbg(codec, "Desktop firmware not found.");
+@@ -8616,6 +8682,8 @@ static void hp_callback(struct hda_codec *codec, struct hda_jack_callback *cb)
+ 	tbl = snd_hda_jack_tbl_get(codec, cb->nid);
+ 	if (tbl)
+ 		tbl->block_report = 1;
++	if (ca0132_quirk(spec) == QUIRK_AE7)
++		return;
+ 	schedule_delayed_work(&spec->unsol_hp_work, msecs_to_jiffies(500));
+ }
+ 
+@@ -9305,6 +9373,11 @@ static void ca0132_mmio_init(struct hda_codec *codec)
+ 	case QUIRK_AE5:
+ 		ca0132_mmio_init_ae5(codec);
+ 		break;
++	case QUIRK_AE7:
++		codec_info(codec,
++			   "AE-7: skipping mmio_init_ae5 after CRST; BAR2+0x1c=%#x\n",
++			   spec->mem_base ? readl(spec->mem_base + 0x1c) : 0);
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -9333,14 +9406,28 @@ static void ae5_register_set(struct hda_codec *codec)
+ 	const unsigned char *data = ca0132_ae5_register_set_data;
+ 	unsigned int i, cur_addr;
+ 	unsigned char tmp[3];
++	bool ae7 = ca0132_quirk(spec) == QUIRK_AE7;
+ 
+-	if (ca0132_quirk(spec) == QUIRK_AE7)
++	/*
++	 * AE-7: SFR writeb/writel here killed DSP download and then hung
++	 * the box (post-DSP pass, 2026-09-02). Keep it off unless the
++	 * unsafe ae7_bar2 module param is set.
++	 */
++	if (ae7 && !ae7_bar2_after_crst) {
++		codec_info(codec,
++			   "AE-7: skipping ae5_register_set (SFR writes hang this card)\n");
++		return;
++	}
++
++	if (ae7)
+ 		chipio_8051_write_pll_pmu(codec, 0x41, 0xc8);
+ 
+ 	chipio_8051_write_direct(codec, 0x93, 0x10);
+ 	chipio_8051_write_pll_pmu(codec, 0x44, 0xc2);
++	if (ae7 && !ae7_gcap_ok(codec, "register_set chipio"))
++		return;
+ 
+-	if (ca0132_quirk(spec) == QUIRK_AE7) {
++	if (ae7) {
+ 		tmp[0] = 0x03;
+ 		tmp[1] = 0x03;
+ 		tmp[2] = 0x07;
+@@ -9352,6 +9439,8 @@ static void ae5_register_set(struct hda_codec *codec)
+ 
+ 	for (i = cur_addr = 0; i < 3; i++, cur_addr++)
+ 		writeb(tmp[i], spec->mem_base + addr[cur_addr]);
++	if (ae7 && !ae7_gcap_ok(codec, "register_set writeb 0x304"))
++		return;
+ 
+ 	/*
+ 	 * First writes are in single bytes, final are in 4 bytes. So, we use
+@@ -9359,11 +9448,17 @@ static void ae5_register_set(struct hda_codec *codec)
+ 	 */
+ 	for (i = 0; cur_addr < 12; i++, cur_addr++)
+ 		writeb(data[i], spec->mem_base + addr[cur_addr]);
++	if (ae7 && !ae7_gcap_ok(codec, "register_set writeb SFR"))
++		return;
+ 
+ 	for (; cur_addr < count; i++, cur_addr++)
+ 		writel(data[i], spec->mem_base + addr[cur_addr]);
++	if (ae7 && !ae7_gcap_ok(codec, "register_set writel SFR"))
++		return;
+ 
+ 	writel(0x00800001, spec->mem_base + 0x20c);
++	if (ae7 && !ae7_gcap_ok(codec, "register_set writel 0x20c"))
++		return;
+ 
+ 	if (ca0132_quirk(spec) == QUIRK_AE7) {
+ 		ca0113_mmio_command_set_type2(codec, 0x48, 0x07, 0x83);
+@@ -9474,13 +9569,19 @@ static int ca0132_init(struct hda_codec *codec)
+ 		spec->dsp_state = DSP_DOWNLOAD_INIT;
+ 	spec->curr_chip_addx = INVALID_CHIP_ADDRESS;
+ 
++	CLASS(snd_hda_power_pm, pm)(codec);
++
+ 	if (ca0132_use_pci_mmio(spec))
+ 		ca0132_mmio_init(codec);
+-
+-	CLASS(snd_hda_power_pm, pm)(codec);
++	if (ca0132_quirk(spec) == QUIRK_AE7 &&
++	    !ae7_gcap_ok(codec, "after mmio_init"))
++		goto ae7_done;
+ 
+ 	if (ca0132_quirk(spec) == QUIRK_AE5 || ca0132_quirk(spec) == QUIRK_AE7)
+ 		ae5_register_set(codec);
++	if (ca0132_quirk(spec) == QUIRK_AE7 &&
++	    !ae7_gcap_ok(codec, "after ae5_register_set"))
++		goto ae7_done;
+ 
+ 	ca0132_init_params(codec);
+ 	ca0132_init_flags(codec);
+@@ -9489,8 +9590,14 @@ static int ca0132_init(struct hda_codec *codec)
+ 
+ 	if (ca0132_use_alt_functions(spec))
+ 		ca0132_alt_init(codec);
++	if (ca0132_quirk(spec) == QUIRK_AE7 &&
++	    !ae7_gcap_ok(codec, "after alt_init"))
++		goto ae7_done;
+ 
+ 	ca0132_download_dsp(codec);
++	if (ca0132_quirk(spec) == QUIRK_AE7 &&
++	    !ae7_gcap_ok(codec, "after dsp_download"))
++		goto ae7_done;
+ 
+ 	ca0132_refresh_widget_caps(codec);
+ 
+@@ -9546,16 +9653,23 @@ static int ca0132_init(struct hda_codec *codec)
+ 		ca0132_select_mic(codec);
+ 	}
+ 
++	if (ca0132_quirk(spec) == QUIRK_AE7)
++		ae7_gcap_ok(codec, "after setup_defaults");
++
++ae7_done:
+ 	snd_hda_jack_report_sync(codec);
+ 
+ 	/*
+-	 * Re set the PlayEnhancement switch on a resume event, because the
+-	 * controls will not be reloaded.
++	 * Push OutFX switch state to the DSP. First init used to skip this
++	 * (only resume did), so FX: Equalizer could show On in the mixer
++	 * while the EQ block was still off — band sliders wrote gains into
++	 * a disabled effect. FX sliders worked because qasmixer unmutes
++	 * those combined widgets on move.
+ 	 */
+-	if (spec->dsp_reload) {
++	if (spec->dsp_reload)
+ 		spec->dsp_reload = false;
++	if (spec->dsp_state == DSP_DOWNLOADED)
+ 		ca0132_pe_switch_set(codec);
+-	}
+ 
+ 	return 0;
+ }
+@@ -9828,7 +9942,9 @@ static void ca0132_config(struct hda_codec *codec)
+ 	/* Default HP/Speaker auto-detect from headphone pin verb: enable if the
+ 	 * pin config indicates presence detect (not AC_DEFCFG_MISC_NO_PRESENCE).
+ 	 */
+-	if (spec->unsol_tag_hp &&
++	if (ca0132_quirk(spec) == QUIRK_AE7)
++		spec->vnode_lswitch[VNID_HP_ASEL - VNODE_START_NID] = 0;
++	else if (spec->unsol_tag_hp &&
+ 	    (snd_hda_query_pin_caps(codec, spec->unsol_tag_hp) & AC_PINCAP_PRES_DETECT) &&
+ 	    !(get_defcfg_misc(snd_hda_codec_get_pincfg(codec, spec->unsol_tag_hp)) &
+ 	      AC_DEFCFG_MISC_NO_PRESENCE))
+diff --git i/sound/hda/controllers/intel.c w/sound/hda/controllers/intel.c
+index 4b03c64..db9ac6a 100644
+--- i/sound/hda/controllers/intel.c
++++ w/sound/hda/controllers/intel.c
+@@ -1952,6 +1952,16 @@ static int azx_first_init(struct azx *chip)
+ 
+ 	gcap = azx_readw(chip, GCAP);
+ 	dev_dbg(card->dev, "chipset global capabilities = 0x%x\n", gcap);
++	/*
++	 * 0xffff means the BAR is not responding (D3cold or dead MMIO).
++	 * Interpreting it as GCAP invents 15+15 streams and a 0xffff
++	 * codec mask, which is what hard-locked the AE-7 (bug 217510).
++	 */
++	if (gcap == 0xffff) {
++		dev_err(card->dev,
++			"GCAP MMIO dead (0xffff); controller inaccessible, aborting probe\n");
++		return -EIO;
++	}
+ 
+ 	/* AMD devices support 40 or 48bit DMA, take the safe one */
+ 	if (chip->pci->vendor == PCI_VENDOR_ID_AMD)
+@@ -2046,17 +2056,21 @@ static int azx_first_init(struct azx *chip)
+ 	err = hda_init_streams(chip);
+ 	if (err < 0)
+ 		return err;
++	dev_info(card->dev, "AE7dbg GCAP after streams %#x\n", azx_readw(chip, GCAP));
+ 
+ 	err = azx_alloc_stream_pages(chip);
+ 	if (err < 0)
+ 		return err;
++	dev_info(card->dev, "AE7dbg GCAP after pages %#x\n", azx_readw(chip, GCAP));
+ 
+ 	/* initialize chip */
+ 	azx_init_pci(chip);
++	dev_info(card->dev, "AE7dbg GCAP after azx_init_pci %#x\n", azx_readw(chip, GCAP));
+ 
+ 	snd_hdac_i915_set_bclk(bus);
+ 
+ 	hda_intel_init_chip(chip, (probe_only[dev] & 2) == 0);
++	dev_info(card->dev, "AE7dbg GCAP after init_chip %#x\n", azx_readw(chip, GCAP));
+ 
+ 	/* codec detection */
+ 	if (!azx_bus(chip)->codec_mask) {
+@@ -2777,6 +2791,15 @@ static const struct pci_device_id azx_ids[] = {
+ 	  .driver_data = AZX_DRIVER_TERA | AZX_DCAPS_NO_64BIT },
+ 	/* Creative X-Fi (CA0110-IBG) */
+ 	/* CTHDA chips */
++	/*
++	 * Sound Blaster AE-7: CORB reset MMIO never completes on this
++	 * controller. Waiting for CORBRP.RST with IRQs off hard-locks
++	 * the machine (kernel bug 217510). Skip the wait and use PIO.
++	 */
++	{ PCI_DEVICE_SUB(PCI_VENDOR_ID_CREATIVE, 0x0010,
++			 PCI_VENDOR_ID_CREATIVE, 0x0081),
++	  .driver_data = AZX_DRIVER_CTHDA | AZX_DCAPS_PRESET_CTHDA |
++			 AZX_DCAPS_NO_TCSEL | AZX_DCAPS_PIO_COMMANDS },
+ 	{ PCI_VDEVICE(CREATIVE, 0x0010),
+ 	  .driver_data = AZX_DRIVER_CTHDA | AZX_DCAPS_PRESET_CTHDA },
+ 	{ PCI_VDEVICE(CREATIVE, 0x0012),
+diff --git i/sound/hda/core/controller.c w/sound/hda/core/controller.c
+index 69e11d6..ddfdf3c 100644
+--- i/sound/hda/core/controller.c
++++ w/sound/hda/core/controller.c
+@@ -15,9 +15,16 @@
+ static void azx_clear_corbrp(struct hdac_bus *bus)
+ {
+ 	int timeout;
++	u16 val;
+ 
+ 	for (timeout = 1000; timeout > 0; timeout--) {
+-		if (snd_hdac_chip_readw(bus, CORBRP) & AZX_CORBRP_RST)
++		val = snd_hdac_chip_readw(bus, CORBRP);
++		/* 0xffff: BAR not responding; spinning here wedges the CPU. */
++		if (val == 0xffff) {
++			dev_err(bus->dev, "CORBRP MMIO dead (0xffff), skipping reset wait\n");
++			return;
++		}
++		if (val & AZX_CORBRP_RST)
+ 			break;
+ 		udelay(1);
+ 	}
+@@ -27,7 +34,12 @@ static void azx_clear_corbrp(struct hdac_bus *bus)
+ 
+ 	snd_hdac_chip_writew(bus, CORBRP, 0);
+ 	for (timeout = 1000; timeout > 0; timeout--) {
+-		if (snd_hdac_chip_readw(bus, CORBRP) == 0)
++		val = snd_hdac_chip_readw(bus, CORBRP);
++		if (val == 0xffff) {
++			dev_err(bus->dev, "CORBRP MMIO dead (0xffff) after RST clear\n");
++			return;
++		}
++		if (val == 0)
+ 			break;
+ 		udelay(1);
+ 	}
+@@ -44,48 +56,68 @@ void snd_hdac_bus_init_cmd_io(struct hdac_bus *bus)
+ {
+ 	WARN_ON_ONCE(!bus->rb.area);
+ 
+-	guard(spinlock_irq)(&bus->reg_lock);
+-	/* CORB set up */
+-	bus->corb.addr = bus->rb.addr;
+-	bus->corb.buf = (__le32 *)bus->rb.area;
+-	snd_hdac_chip_writel(bus, CORBLBASE, (u32)(bus->corb.addr + bus->addr_offset));
+-	snd_hdac_chip_writel(bus, CORBUBASE, upper_32_bits(bus->corb.addr + bus->addr_offset));
++	/*
++	 * Immediate-command (PIO) mode: do not program CORB/RIRB DMA.
++	 * On Sound Blaster AE-7, writing CORB buffer addresses makes
++	 * the BAR stop responding (GCAP becomes 0xffff).
++	 */
++	if (bus->use_pio_for_commands) {
++		guard(spinlock_irq)(&bus->reg_lock);
++		snd_hdac_chip_updatel(bus, GCTL, AZX_GCTL_UNSOL, AZX_GCTL_UNSOL);
++		return;
++	}
+ 
+-	/* set the corb size to 256 entries (ULI requires explicitly) */
+-	snd_hdac_chip_writeb(bus, CORBSIZE, 0x02);
+-	/* set the corb write pointer to 0 */
+-	snd_hdac_chip_writew(bus, CORBWP, 0);
++	scoped_guard(spinlock_irq, &bus->reg_lock) {
++		/* CORB set up */
++		bus->corb.addr = bus->rb.addr;
++		bus->corb.buf = (__le32 *)bus->rb.area;
++		snd_hdac_chip_writel(bus, CORBLBASE, (u32)(bus->corb.addr + bus->addr_offset));
++		snd_hdac_chip_writel(bus, CORBUBASE, upper_32_bits(bus->corb.addr + bus->addr_offset));
+ 
+-	/* reset the corb hw read pointer */
+-	snd_hdac_chip_writew(bus, CORBRP, AZX_CORBRP_RST);
++		/* set the corb size to 256 entries (ULI requires explicitly) */
++		snd_hdac_chip_writeb(bus, CORBSIZE, 0x02);
++		/* set the corb write pointer to 0 */
++		snd_hdac_chip_writew(bus, CORBWP, 0);
++
++		/* reset the corb hw read pointer */
++		snd_hdac_chip_writew(bus, CORBRP, AZX_CORBRP_RST);
++	}
++
++	/*
++	 * Wait for CORBRP.RST without the IRQ-off spinlock. On some
++	 * Creative CA0132 cards (AE-7) this MMIO never completes; doing
++	 * the poll with irqs disabled hard-locks the machine.
++	 */
+ 	if (!bus->corbrp_self_clear)
+ 		azx_clear_corbrp(bus);
+ 
+-	/* enable corb dma */
+-	if (!bus->use_pio_for_commands)
+-		snd_hdac_chip_writeb(bus, CORBCTL, AZX_CORBCTL_RUN);
++	scoped_guard(spinlock_irq, &bus->reg_lock) {
++		/* enable corb dma */
++		if (!bus->use_pio_for_commands)
++			snd_hdac_chip_writeb(bus, CORBCTL, AZX_CORBCTL_RUN);
+ 
+-	/* RIRB set up */
+-	bus->rirb.addr = bus->rb.addr + 2048;
+-	bus->rirb.buf = (__le32 *)(bus->rb.area + 2048);
+-	bus->rirb.wp = bus->rirb.rp = 0;
+-	memset(bus->rirb.cmds, 0, sizeof(bus->rirb.cmds));
+-	snd_hdac_chip_writel(bus, RIRBLBASE, (u32)(bus->rirb.addr + bus->addr_offset));
+-	snd_hdac_chip_writel(bus, RIRBUBASE, upper_32_bits(bus->rirb.addr + bus->addr_offset));
++		/* RIRB set up */
++		bus->rirb.addr = bus->rb.addr + 2048;
++		bus->rirb.buf = (__le32 *)(bus->rb.area + 2048);
++		bus->rirb.wp = bus->rirb.rp = 0;
++		memset(bus->rirb.cmds, 0, sizeof(bus->rirb.cmds));
++		snd_hdac_chip_writel(bus, RIRBLBASE, (u32)(bus->rirb.addr + bus->addr_offset));
++		snd_hdac_chip_writel(bus, RIRBUBASE, upper_32_bits(bus->rirb.addr + bus->addr_offset));
+ 
+-	/* set the rirb size to 256 entries (ULI requires explicitly) */
+-	snd_hdac_chip_writeb(bus, RIRBSIZE, 0x02);
+-	/* reset the rirb hw write pointer */
+-	snd_hdac_chip_writew(bus, RIRBWP, AZX_RIRBWP_RST);
+-	/* set N=1, get RIRB response interrupt for new entry */
+-	snd_hdac_chip_writew(bus, RINTCNT, 1);
+-	/* enable rirb dma and response irq */
+-	if (bus->not_use_interrupts)
+-		snd_hdac_chip_writeb(bus, RIRBCTL, AZX_RBCTL_DMA_EN);
+-	else
+-		snd_hdac_chip_writeb(bus, RIRBCTL, AZX_RBCTL_DMA_EN | AZX_RBCTL_IRQ_EN);
+-	/* Accept unsolicited responses */
+-	snd_hdac_chip_updatel(bus, GCTL, AZX_GCTL_UNSOL, AZX_GCTL_UNSOL);
++		/* set the rirb size to 256 entries (ULI requires explicitly) */
++		snd_hdac_chip_writeb(bus, RIRBSIZE, 0x02);
++		/* reset the rirb hw write pointer */
++		snd_hdac_chip_writew(bus, RIRBWP, AZX_RIRBWP_RST);
++		/* set N=1, get RIRB response interrupt for new entry */
++		snd_hdac_chip_writew(bus, RINTCNT, 1);
++		/* enable rirb dma and response irq */
++		if (bus->not_use_interrupts)
++			snd_hdac_chip_writeb(bus, RIRBCTL, AZX_RBCTL_DMA_EN);
++		else
++			snd_hdac_chip_writeb(bus, RIRBCTL, AZX_RBCTL_DMA_EN | AZX_RBCTL_IRQ_EN);
++		/* Accept unsolicited responses */
++		snd_hdac_chip_updatel(bus, GCTL, AZX_GCTL_UNSOL, AZX_GCTL_UNSOL);
++	}
+ }
+ EXPORT_SYMBOL_GPL(snd_hdac_bus_init_cmd_io);
+ 
+@@ -495,9 +527,17 @@ void snd_hdac_bus_enter_link_reset(struct hdac_bus *bus)
+ 	snd_hdac_chip_updatel(bus, GCTL, AZX_GCTL_RESET, 0);
+ 
+ 	timeout = jiffies + msecs_to_jiffies(100);
+-	while ((snd_hdac_chip_readb(bus, GCTL) & AZX_GCTL_RESET) &&
+-	       time_before(jiffies, timeout))
++	while (time_before(jiffies, timeout)) {
++		u8 gctl = snd_hdac_chip_readb(bus, GCTL);
++
++		if (gctl == 0xff) {
++			dev_err(bus->dev, "GCTL MMIO dead during enter-reset\n");
++			return;
++		}
++		if (!(gctl & AZX_GCTL_RESET))
++			break;
+ 		usleep_range(500, 1000);
++	}
+ }
+ EXPORT_SYMBOL_GPL(snd_hdac_bus_enter_link_reset);
+ 
+@@ -514,8 +554,17 @@ void snd_hdac_bus_exit_link_reset(struct hdac_bus *bus)
+ 	snd_hdac_chip_updateb(bus, GCTL, AZX_GCTL_RESET, AZX_GCTL_RESET);
+ 
+ 	timeout = jiffies + msecs_to_jiffies(100);
+-	while (!snd_hdac_chip_readb(bus, GCTL) && time_before(jiffies, timeout))
++	while (time_before(jiffies, timeout)) {
++		u8 gctl = snd_hdac_chip_readb(bus, GCTL);
++
++		if (gctl == 0xff) {
++			dev_err(bus->dev, "GCTL MMIO dead during exit-reset\n");
++			return;
++		}
++		if (gctl)
++			break;
+ 		usleep_range(500, 1000);
++	}
+ }
+ EXPORT_SYMBOL_GPL(snd_hdac_bus_exit_link_reset);
+ 
+@@ -552,7 +601,14 @@ int snd_hdac_bus_reset_link(struct hdac_bus *bus, bool full_reset)
+ 
+ 	/* detect codecs */
+ 	if (!bus->codec_mask) {
+-		bus->codec_mask = snd_hdac_chip_readw(bus, STATESTS);
++		unsigned int sts = snd_hdac_chip_readw(bus, STATESTS);
++
++		/* 0xffff is a dead BAR, not 16 present codecs */
++		if (sts == 0xffff) {
++			dev_err(bus->dev, "STATESTS MMIO dead (0xffff)\n");
++			sts = 0;
++		}
++		bus->codec_mask = sts;
+ 		dev_dbg(bus->dev, "codec_mask = 0x%lx\n", bus->codec_mask);
+ 	}
+ 
+@@ -613,9 +669,13 @@ bool snd_hdac_bus_init_chip(struct hdac_bus *bus, bool full_reset)
+ 
+ 	/* reset controller */
+ 	snd_hdac_bus_reset_link(bus, full_reset);
++	dev_info(bus->dev, "AE7dbg GCAP after reset_link %#x\n",
++		 snd_hdac_chip_readw(bus, GCAP));
+ 
+ 	/* clear interrupts */
+ 	azx_int_clear(bus);
++	dev_info(bus->dev, "AE7dbg GCAP after int_clear %#x\n",
++		 snd_hdac_chip_readw(bus, GCAP));
+ 
+ 	/* initialize the codec command I/O */
+ 	snd_hdac_bus_init_cmd_io(bus);

@@ -1,0 +1,15 @@
+[Unit]
+Description=Bind patched Sound Blaster AE-7 after pci-stub boot
+Documentation=file:///home/rob/ae7-fix
+After=systemd-udev-settle.service systemd-modules-load.service sound.target
+Before=display-manager.service
+ConditionPathExists=/sys/bus/pci/devices/0000:06:00.0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ae7-cold-bind.sh
+TimeoutStartSec=90
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

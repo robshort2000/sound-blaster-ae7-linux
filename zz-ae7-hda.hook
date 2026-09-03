@@ -1,0 +1,13 @@
+[Trigger]
+Operation = Upgrade
+Operation = Install
+Type = Package
+Target = linux
+Target = linux-lts
+Target = linux-zen
+Target = linux-hardened
+
+[Action]
+Description = Warn that AE-7 patched HDA modules need reinstall after a kernel upgrade
+When = PostTransaction
+Exec = /usr/bin/printf %s\n "AE-7: kernel upgrade replaced stock HDA modules. After reboot into the new kernel run: pkexec /usr/local/sbin/ae7-install-modules.sh && systemctl enable --now ae7-cold-bind.service"

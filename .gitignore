@@ -1,0 +1,17 @@
+linux-7.1.9/
+ca0132-oot/*.o
+ca0132-oot/*.ko
+ca0132-oot/*.mod
+ca0132-oot/*.mod.c
+ca0132-oot/*.mod.o
+ca0132-oot/Module.symvers
+ca0132-oot/modules.order
+ca0132-oot/.*.cmd
+ca0132-oot/.tmp_versions/
+stock-module-backup/
+*.ko
+*.o
+*.mod.c
+*.cmd
+__pycache__/
+*.pyc
