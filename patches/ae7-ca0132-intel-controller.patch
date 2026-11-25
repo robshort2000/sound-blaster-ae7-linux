@@ -394,10 +394,26 @@ index 69e11d6..ddfdf3c 100644
 +	 * Immediate-command (PIO) mode: do not program CORB/RIRB DMA.
 +	 * On Sound Blaster AE-7, writing CORB buffer addresses makes
 +	 * the BAR stop responding (GCAP becomes 0xffff).
++	 *
++	 * Still *stop* leftover CORB/RIRB DMA. Firmware/reset can leave
++	 * CORB running against a bogus address (observed AMD-Vi faults
++	 * at 0xfff80000). That DMA eventually kills analog while PCM
++	 * still looks healthy. Do not write CORB/RIRB base registers.
 +	 */
 +	if (bus->use_pio_for_commands) {
++		u8 corbctl, rirbctl;
++		u16 gcap;
++
 +		guard(spinlock_irq)(&bus->reg_lock);
++		corbctl = snd_hdac_chip_readb(bus, CORBCTL);
++		rirbctl = snd_hdac_chip_readb(bus, RIRBCTL);
++		snd_hdac_chip_writeb(bus, CORBCTL, 0);
++		snd_hdac_chip_writeb(bus, RIRBCTL, 0);
 +		snd_hdac_chip_updatel(bus, GCTL, AZX_GCTL_UNSOL, AZX_GCTL_UNSOL);
++		gcap = snd_hdac_chip_readw(bus, GCAP);
++		dev_info(bus->dev,
++			 "PIO cmd: stopped leftover CORBCTL=%#x RIRBCTL=%#x GCAP=%#x\n",
++			 corbctl, rirbctl, gcap);
 +		return;
 +	}
  

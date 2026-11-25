@@ -1,0 +1,15 @@
+[Unit]
+Description=Keep Sound Blaster AE-7 analog path alive
+Documentation=file:///home/rob/ae7-fix
+After=ae7-cold-bind.service
+# Do not Wants= the bind. Restarting this guard used to start a second probe,
+# and that rebind is what hard-locked the machine.
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/ae7-analog-guard.sh
+Restart=on-failure
+RestartSec=15
+
+[Install]
+# Pulled in by ae7-cold-bind.service. Not a multi-user.target dependency.

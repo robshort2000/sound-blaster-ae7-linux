@@ -1,15 +1,21 @@
 [Unit]
 Description=Bind patched Sound Blaster AE-7 after pci-stub boot
 Documentation=file:///home/rob/ae7-fix
-After=systemd-udev-settle.service systemd-modules-load.service sound.target
-Before=display-manager.service
+After=systemd-udev-settle.service systemd-modules-load.service sound.target graphical.target
 ConditionPathExists=/sys/bus/pci/devices/0000:06:00.0
+ConditionPathExists=!/run/ae7.dead
+# Started by ae7-cold-bind.timer once the desktop is up. Must not be wanted
+# by multi-user.target: that orders the oneshot Before= the target and holds
+# the login screen on a card that sometimes falls off the bus.
+Wants=ae7-analog-guard.service
+Before=ae7-analog-guard.service
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/ae7-cold-bind.sh
 TimeoutStartSec=90
 RemainAfterExit=yes
+Restart=no
 
 [Install]
-WantedBy=multi-user.target
+# No WantedBy=. The timer is what starts this unit.

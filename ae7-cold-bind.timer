@@ -1,0 +1,14 @@
+[Unit]
+Description=Bind Sound Blaster AE-7 after the desktop is up
+Documentation=file:///home/rob/ae7-fix
+
+[Timer]
+# graphical.target only waits for this timer to become active, not for the
+# bind. Ten seconds leaves room for the NVIDIA modeset and for startup
+# apps to be running before the AE-7 probe.
+OnActiveSec=10s
+AccuracySec=1s
+Unit=ae7-cold-bind.service
+
+[Install]
+WantedBy=graphical.target

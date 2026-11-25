@@ -50,6 +50,16 @@ def main():
             return 2
         gpio = struct.unpack_from("<H", m2, 0x320)[0]
         print(f"BAR2+0x320 before {gpio:#06x}", flush=True)
+        # Stop leftover CORB/RIRB DMA before bind. PIO will not use it;
+        # leaving it running IOMMU-faults at 0xfff80000 and later kills analog.
+        corbctl = m0[0x4c]
+        rirbctl = m0[0x5c]
+        print(f"CORBCTL={corbctl:#04x} RIRBCTL={rirbctl:#04x} before stop", flush=True)
+        m0[0x4c] = 0
+        m0[0x5c] = 0
+        m0.flush()
+        if not alive(m0, "corb dma stop"):
+            return 5
         # pin 0 on, then pin 1 on (ae7_setup_defaults)
         struct.pack_into("<H", m2, 0x320, 0x0100)
         m2.flush()
