@@ -11,9 +11,10 @@
 # Wants= retried a failed bind and hard-locked the machine. The bind unit
 # starts this guard. See /home/rob/ae7-fix/README.md.
 #
-# DEV is the AE-7 only while that card is installed. With it removed,
-# 0000:06:00.0 is the MAXIO NVMe (config dword 4b1e0216). Do not write
-# BARs from here onto "whatever is at 06:00.0".
+# DEV is the AE-7's bus address on the test machine (`lspci -d 1102:0010`).
+# On that motherboard, removing the card left a MAXIO NVMe (1e4b:1602,
+# config dword 4b1e0216) at the same address. This guard does not check
+# the vendor id. Point it at your AE-7, and stop it if that device is gone.
 set -uo pipefail
 DEV=0000:06:00.0
 LOG=/var/log/ae7-analog-guard.log
@@ -77,6 +78,8 @@ while sleep 5; do
 		echo 1 >"$STAMP" 2>/dev/null || true
 		exit 0
 	fi
+	# AMD-Vi text from the test machine, for the AE-7 at DEV. Another IOMMU
+	# logs a different line, and another bus address will not match.
 	n=$(journalctl -k --since '8 sec ago' --no-pager 2>/dev/null | grep -c 'snd_hda_intel 0000:06:00.0: AMD-Vi: Event logged \[IO_PAGE_FAULT' || true)
 	now=$(date +%s)
 	if (( n > 0 )); then

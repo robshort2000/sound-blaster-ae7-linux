@@ -3,6 +3,9 @@
 
 Does not run mmio_init (that table killed a cold card). Two writew to 0x320.
 Abort if GCAP/PCI dies.
+
+DEV is the AE-7 bus address on the test machine. Change it to yours
+(`lspci -d 1102:0010`) before running this.
 """
 import os
 import sys

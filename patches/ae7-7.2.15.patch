@@ -1,9 +1,17 @@
-WARNING: Vibe-coded against one machine only (Omarchy, Sound Blaster AE-7
-1102:0010 subsystem 1102:0081 behind an ASMedia ASM1083/1085 rev 03).
-Not tested on any other system. Use at your own risk. These changes can
-hard-lock the machine, kill the PCI function until a full PSU power-off,
-or IRQ-storm a dead card. Do not drop pci-stub. Do not bind a card whose
-PCI config is 0xffffffff.
+WARNING: Vibe-coded. Tested on one machine only. Use at your own risk.
+
+The card under test was a Sound Blaster AE-7, PCI 1102:0010 subsystem
+1102:0081, behind an ASMedia ASM1083/1085 rev 03 bridge. The host happened
+to be an AMD Omarchy workstation. This patch does not depend on that
+board, GPU, or bootloader, and it has not been tried on any other machine.
+
+These changes can hard-lock the machine, kill the PCI function until a
+full PSU power-off, or IRQ-storm a dead card. Keep pci-stub on 1102:0010
+until a patched bind is proven on your machine. Skip any bind whose PCI
+config reads 0xffffffff.
+
+The PCI match is AE-7 subsystem 1102:0081. AE-5 (1102:0012) is a different
+device and is not this failure.
 
 Apply to Linux 7.2.15 sound/hda/ with:
   patch -p1 < patches/ae7-7.2.15.patch

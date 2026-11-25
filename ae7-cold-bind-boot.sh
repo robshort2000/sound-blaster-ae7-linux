@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Boot path: AE-7 is on pci-stub (cmdline). Patched snd-hda-intel is already
-# loaded for HDMI/onboard. GPIO under stub, then bind once.
+# Boot path: the AE-7 is on pci-stub (cmdline). GPIO under the stub, then
+# one bind. On the test machine snd-hda-intel was already loaded for the
+# GPU's HDMI audio, so this script modprobes it and does not reload it.
 #
 # Why this exists: stock udev probe hard-locks on CORBRP.RST (kernel bug
 # 217510). This oneshot is started by ae7-cold-bind.timer after
@@ -26,6 +27,9 @@
 # 0x6400. Both headphone channels worked. Details in the README section
 # "Successful bind, 2026-11-07 15:51".
 set -uo pipefail
+# Bus address of the AE-7 on the test machine. Yours is `lspci -d 1102:0010`.
+# On that motherboard, pulling the card left a MAXIO NVMe at this same
+# address. Confirm the device before you point the script at it.
 DEV=0000:06:00.0
 LOG=/var/log/ae7-cold-bind.log
 GPIO=/usr/local/lib/ae7/bar2-gpio-hp.py

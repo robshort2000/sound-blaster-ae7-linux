@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Stop leftover AE-7 CORB/RIRB DMA. PIO verbs do not use it.
 
-Firmware/reset can leave CORB running against a bogus address (observed
-AMD-Vi IO_PAGE_FAULT at 0xfff80000). That DMA eventually kills analog
-while PCM still looks healthy.
+Firmware/reset can leave CORB running against a bogus address. On the
+AMD test machine that showed up as AMD-Vi IO_PAGE_FAULT at 0xfff80000.
+That DMA eventually kills analog while PCM still looks healthy.
+
+DEV is the AE-7 bus address on the test machine. Change it to yours
+(`lspci -d 1102:0010`).
 
 Do NOT program CORB/RIRB buffer addresses. Do NOT rebind. Abort if GCAP
 dies. Safe to run while snd_hda_intel is bound.

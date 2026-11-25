@@ -2,6 +2,7 @@
 Description=Bind patched Sound Blaster AE-7 after pci-stub boot
 Documentation=file:///home/rob/ae7-fix
 After=systemd-udev-settle.service systemd-modules-load.service sound.target graphical.target
+# 0000:06:00.0 is the AE-7 on the test machine. Use `lspci -d 1102:0010`.
 ConditionPathExists=/sys/bus/pci/devices/0000:06:00.0
 ConditionPathExists=!/run/ae7.dead
 # Started by ae7-cold-bind.timer once the desktop is up. Must not be wanted
