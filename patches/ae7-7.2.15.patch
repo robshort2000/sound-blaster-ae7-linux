@@ -245,7 +245,34 @@ from the kernel tree root. The 7.1.9 patch does not apply cleanly here.
  	snd_hdac_bus_init_cmd_io(bus);
 --- a/sound/hda/controllers/intel.c
 +++ b/sound/hda/controllers/intel.c
-@@ -1952,6 +1952,16 @@
+@@ -53,6 +53,8 @@
+ #include <linux/vga_switcheroo.h>
+ #include <linux/apple-gmux.h>
+ #include <linux/firmware.h>
++#include <linux/iommu.h>
++#include <linux/iova.h>
+ #include <sound/hda_codec.h>
+ #include "intel.h"
+ 
+@@ -1341,6 +1343,8 @@
+ /*
+  * destructor
+  */
++static void ae7_unmap_bogus_iovas(struct pci_dev *pci);
++
+ static void azx_free(struct azx *chip)
+ {
+ 	struct pci_dev *pci = chip->pci;
+@@ -1350,6 +1354,8 @@
+ 	if (hda->freed)
+ 		return;
+ 
++	ae7_unmap_bogus_iovas(pci);
++
+ 	if (azx_has_pm_runtime(chip) && chip->running) {
+ 		pm_runtime_get_noresume(&pci->dev);
+ 		pm_runtime_forbid(&pci->dev);
+@@ -1952,6 +1958,16 @@
  
  	gcap = azx_readw(chip, GCAP);
  	dev_dbg(card->dev, "chipset global capabilities = 0x%x\n", gcap);
@@ -262,7 +289,7 @@ from the kernel tree root. The 7.1.9 patch does not apply cleanly here.
  
  	/* AMD devices support 40 or 48bit DMA, take the safe one */
  	if (chip->pci->vendor == PCI_VENDOR_ID_AMD)
-@@ -2046,17 +2056,21 @@
+@@ -2046,17 +2062,21 @@
  	err = hda_init_streams(chip);
  	if (err < 0)
  		return err;
@@ -284,7 +311,142 @@ from the kernel tree root. The 7.1.9 patch does not apply cleanly here.
  
  	/* codec detection */
  	if (!azx_bus(chip)->codec_mask) {
-@@ -2779,6 +2793,15 @@
+@@ -2339,6 +2359,124 @@
+ 	[AZX_DRIVER_TERA] = 1,
+ };
+ 
++/*
++ * AE-7 firmware DMA-reads a fixed IOVA (0xfff80000, also seen at
++ * 0xfff40000). The CORB run bit is not left set, so the 2s watchdog
++ * never catches it. The resulting AMD-Vi fault storm stalls the GPU.
++ * Writing CORB base registers kills this card, so give the IOMMU a
++ * dummy page instead. Reads and writes land on that page.
++ */
++static void *ae7_bogus_page;
++static bool ae7_bogus_mapped[2];
++static const u64 ae7_bogus_iovas[] = { 0xfff40000ULL, 0xfff80000ULL };
++
++/*
++ * struct iommu_dma_cookie is private to dma-iommu.c. Its first member is
++ * the IOVA domain the DMA API allocates from. A raw iommu_map() of
++ * 0xfff80000 does not tell that allocator, and the DSP loader's 512KB
++ * buffer is size-aligned at the top of the 32-bit aperture, which is
++ * exactly 0xfff80000. The map then fails, dspload_image() returns
++ * immediately, and snd_dma_wc_alloc()'s error path kills the opener.
++ */
++struct ae7_dma_cookie {
++	struct iova_domain iovad;
++};
++
++static bool ae7_is_this_card(struct pci_dev *pci)
++{
++	return pci && pci->vendor == 0x1102 && pci->device == 0x0010 &&
++	       pci->subsystem_vendor == 0x1102 && pci->subsystem_device == 0x0081;
++}
++
++static void ae7_map_bogus_iovas(struct pci_dev *pci)
++{
++	struct iommu_domain *dom;
++	phys_addr_t phys;
++	int i;
++
++	if (!ae7_is_this_card(pci))
++		return;
++
++	dom = iommu_get_domain_for_dev(&pci->dev);
++	if (!dom)
++		return;
++
++	if (!ae7_bogus_page) {
++		ae7_bogus_page = (void *)get_zeroed_page(GFP_KERNEL);
++		if (!ae7_bogus_page)
++			return;
++	}
++	phys = virt_to_phys(ae7_bogus_page);
++
++	for (i = 0; i < ARRAY_SIZE(ae7_bogus_iovas); i++) {
++		int ret;
++
++		if (ae7_bogus_mapped[i] || iommu_iova_to_phys(dom, ae7_bogus_iovas[i]))
++			continue;
++		/*
++		 * Keep the DMA API from handing this page to the DSP
++		 * buffer. If the reserve fails, leave the IOVA unmapped
++		 * rather than stealing it out from under the allocator.
++		 */
++		if (iommu_is_dma_domain(dom) &&
++		    dom->cookie_type == IOMMU_COOKIE_DMA_IOVA &&
++		    dom->iova_cookie) {
++			struct ae7_dma_cookie *cookie = (void *)dom->iova_cookie;
++			unsigned long pfn;
++			struct iova *res;
++
++			if (!cookie->iovad.granule) {
++				dev_warn(&pci->dev,
++					 "AE-7: IOVA domain not ready; skip dummy %#llx\n",
++					 ae7_bogus_iovas[i]);
++				continue;
++			}
++			pfn = iova_pfn(&cookie->iovad, ae7_bogus_iovas[i]);
++			res = reserve_iova(&cookie->iovad, pfn, pfn);
++			if (!res) {
++				dev_warn(&pci->dev,
++					 "AE-7: reserve IOVA %#llx failed; skip dummy map\n",
++					 ae7_bogus_iovas[i]);
++				continue;
++			}
++			dev_info(&pci->dev, "AE-7: reserved IOVA %#llx\n",
++				 ae7_bogus_iovas[i]);
++		}
++		ret = iommu_map(dom, ae7_bogus_iovas[i], phys, PAGE_SIZE,
++				IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
++		if (ret) {
++			dev_warn(&pci->dev, "AE-7: dummy IOVA %#llx map failed (%d)\n",
++				 ae7_bogus_iovas[i], ret);
++			continue;
++		}
++		ae7_bogus_mapped[i] = true;
++		dev_info(&pci->dev, "AE-7: dummy page at IOVA %#llx\n",
++			 ae7_bogus_iovas[i]);
++	}
++}
++
++static void ae7_unmap_bogus_iovas(struct pci_dev *pci)
++{
++	struct iommu_domain *dom;
++	int i;
++
++	if (!ae7_is_this_card(pci))
++		return;
++
++	dom = iommu_get_domain_for_dev(&pci->dev);
++	for (i = 0; i < ARRAY_SIZE(ae7_bogus_iovas); i++) {
++		if (!ae7_bogus_mapped[i])
++			continue;
++		if (dom)
++			iommu_unmap(dom, ae7_bogus_iovas[i], PAGE_SIZE);
++		ae7_bogus_mapped[i] = false;
++	}
++	if (ae7_bogus_page) {
++		free_page((unsigned long)ae7_bogus_page);
++		ae7_bogus_page = NULL;
++	}
++}
++
+ static int azx_probe_continue(struct azx *chip)
+ {
+ 	struct hda_intel *hda = container_of(chip, struct hda_intel, chip);
+@@ -2349,6 +2487,9 @@
+ 
+ 	if (chip->disabled || hda->init_failed)
+ 		return -EIO;
++
++	/* IOMMU only. Does not touch card MMIO. */
++	ae7_map_bogus_iovas(pci);
+ 	if (hda->probe_retry)
+ 		goto probe_retry;
+ 
+@@ -2779,6 +2920,15 @@
  	  .driver_data = AZX_DRIVER_TERA | AZX_DCAPS_NO_64BIT },
  	/* Creative X-Fi (CA0110-IBG) */
  	/* CTHDA chips */

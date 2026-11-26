@@ -134,7 +134,7 @@ Stock `snd_hda_intel` + `snd_hda_codec_ca0132` on this AE-7:
 4. **DSP firmware pick.** This AE-7 loads `ctefx-desktop.bin`, not `ctefx.bin`.
 5. **Analog route.** Even with DSP alive, line-out stays silent until BAR2 GPIO (pins 0/1) and **post-DSP** `ca0113_mmio_command_set`. GPIO under the stub is wiped by CRST; the driver re-applies GPIO after DSP.
 6. **EQ sliders.** Mixer can show FX: Equalizer **On** while DSP req 9 is still off (`pe_switch_set` used to run only on resume). Band widgets are volume-only, so they never unmute the EQ block. Toggle Equalizer off/on, or use the patched init that always pushes OutFX to the DSP.
-7. **Analog dies after leftover CORB DMA goes quiet.** PIO skips *programming* CORB, but firmware restarts CORB/RIRB DMA against a bogus address (`0xfff80000`, later `0xfff40000`). On the AMD test machine, AMD-Vi logged `IO_PAGE_FAULT` for the card's bus address while it ran. PCM still plays. When the faults stop, analog goes silent. Leave `iommu=pt` unset. Leave the CORB base registers alone. Clearing `CORBCTL` and `RIRBCTL` run bits is the safe stop. Userspace cannot mmap BAR0 once `snd_hda_intel` owns it (`EINVAL`). The codec watchdog in `ca0132.c` (`ae7_corb_work`) clears those run bits every 2s. The guard re-selects Speakers only after two quiet polls, because a re-select in a one-poll gap on 2026-11-11 16:10 lost to the DMA restarting.
+7. **Analog dies after leftover CORB DMA goes quiet.** PIO skips *programming* CORB, but firmware DMA-reads a fixed IOVA (`0xfff80000`, later also `0xfff40000`). On the AMD test machine, AMD-Vi logged `IO_PAGE_FAULT` for the card's bus address while it ran. PCM still plays. When the faults stop, analog goes silent. A long fault storm stalls the GPU on the same platform and the display hard-locks. Leave `iommu=pt` unset. Leave the CORB base registers alone. Clearing `CORBCTL` and `RIRBCTL` run bits is the safe stop, but on 2026-11-25 the 2s watchdog never observed the run bit across 2350 faults, so it does not stop this storm. `snd-hda-intel` reserves both IOVAs in the DMA API allocator and then maps one dummy page at each (`IOMMU_READ|IOMMU_WRITE`) during probe, so the reads complete and the IOMMU does not fault. The reserve is required. A raw `iommu_map()` of `0xfff80000` is also where the DSP loader's 512 KB buffer is placed, and that collision fails the download. See 2026-11-26. Userspace cannot mmap BAR0 once `snd_hda_intel` owns it (`EINVAL`). The codec watchdog in `ca0132.c` (`ae7_corb_work`) still clears those run bits every 2s. The guard re-selects Speakers only after two quiet polls, because a re-select in a one-poll gap on 2026-11-11 16:10 lost to the DMA restarting.
 
 ## What we did not keep (lethal on this card)
 
@@ -197,6 +197,20 @@ Mixer: leave **HP/Speaker Auto Detect** off.
 
 After bind, `stop-corb-dma.py` clears leftover CORB/RIRB DMA. `ae7-analog-guard.service` is started by the bind unit (not by `multi-user.target`) and re-selects Speakers when an IOMMU fault burst goes quiet.
 
+## 2026-11-26 dummy IOVA stole the DSP buffer
+
+On 2026-11-25 at 15:16, `snd-hda-intel` started mapping a dummy page at `0xfff40000` and `0xfff80000` with `iommu_map()` during probe. That stopped the AMD-Vi fault storm. It did not tell the DMA API's IOVA allocator. The last boot that logged `ca0132 DSP downloaded and running` was 15:06 the same day, before that module was installed.
+
+The AE-7 streaming mask is 32-bit (`GCAP` has no 64OK). The DSP loader asks for a 512 KB write-combining buffer (`DSP_DMA_WRITE_BUFLEN_INIT` times 2). The allocator hands a size-aligned buffer out at the top of the 32-bit aperture, which is `0xfff80000`. That is the second dummy page. `dma_map_single()` fails.
+
+`dspload_image()` then returns before any segment is written. The kernel logs `AE-7 dspxfr_image begin` and, in the same second, `ca0132 DSP load image failed`. There is no `chipio before dma` line and no `MMIO dead` line. `GCAP` stays `0x6400` and PCI config stays `02111000`. The card is not dead. A full PSU-off does not clear it, because the next probe maps the same two pages. Three boots on 2026-11-26 failed this way. Two of those cold-bind runs also exited 1 because the Creative ALSA card had not appeared within the script's 8 second wait. The bind that did see the card still had a failed DSP.
+
+WirePlumber then opens the playback device and sets hardware parameters. That is the same write-combining path. `snd_dma_wc_alloc()` frees `dmab->area` when `dma_map_single()` fails, and that pointer is still NULL. `free_pages_exact()` faults. The process is noted as exited with IRQs disabled, and the analog PCM stays `OPEN` under the dead pid. WirePlumber's main thread is a zombie while its other threads stay alive, so systemd does not restart it. `pipewire-pulse` accepts the socket and never finishes the handshake. `pactl info` hangs. Battle.net's voice init blocks in ALSA's Pulse connect, 30 seconds at a time, for about two minutes, and only then creates the window. The journal line is `PulseAudio: Unable to connect: Timeout`. The client log resumes at `Audio device monitor using already-initialized COM`.
+
+The fix reserves each dummy IOVA with `reserve_iova()` on the DMA cookie before `iommu_map()`. If the reserve fails, that page is left unmapped. A raw `iommu_map()` of those addresses is the bug. Do not load a module that only does the map.
+
+The 08:58 reboot with the rebuilt module logged `AE-7: reserved IOVA` for both addresses, then `dummy page at IOVA`, then `chipio before dma` for the 65528-word segment and the two short remainders, then `ca0132 DSP downloaded and running`. Cold bind selected Speakers. The default sink was `alsa_output.pci-0000_06_00.0.analog-stereo`. WirePlumber stayed up. `pactl` answered. The analog PCM was closed. Config stayed `02111000`. There was no `/run/ae7.dead`.
+
 ## Install
 
 Build the modules for the kernel you are actually running. Apply `patches/ae7-ca0132-intel-controller.patch` on Linux 7.1.9 `sound/hda/`. Apply `patches/ae7-7.2.15.patch` on Linux 7.2.15 `sound/hda/`. Rebuild `snd-hda-core`, `snd-hda-intel`, and `snd-hda-codec-ca0132`. On the 7.2.15 test, the distro `snd-hda-codec` was left in place because that file was not patched.
@@ -222,7 +236,7 @@ Enable the timer only after one manual bind of a live card has logged `ca0132 DS
 
 ## Kernel files touched
 
-- `sound/hda/controllers/intel.c` — AE-7 subsystem `1102:0081` uses PIO; `GCAP` `0xffff` aborts probe
+- `sound/hda/controllers/intel.c` — AE-7 subsystem `1102:0081` uses PIO; `GCAP` `0xffff` aborts probe; dummy IOVAs are reserved in the DMA allocator before they are mapped
 - `sound/hda/core/controller.c` — skip CORB programming when PIO; stop leftover CORB/RIRB DMA; a `0xffff` read returns
 - `sound/hda/codecs/ca0132.c` — DSP/BAR2 policy, auto-detect forced off, EQ init sync
 
